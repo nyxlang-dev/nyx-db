@@ -1,0 +1,89 @@
+// commands.nx — Command dispatch for nyx-db
+//
+// Receives RESP command array, joins into SQL string,
+// tokenizes, parses, executes, returns RESP response.
+
+fn dispatch_command(cmd: Array, fd: int) -> String {
+    if cmd.length() == 0 {
+        return resp_error("empty command")
+    }
+
+    let raw: String = cmd[0]
+    let first: String = raw.toUpper()
+
+    // PING
+    if first == "PING" {
+        return resp_simple_string("PONG")
+    }
+
+    // QUIT
+    if first == "QUIT" {
+        return "__QUIT__"
+    }
+
+    // INFO
+    if first == "INFO" {
+        let table_keys: Array = g_tables.keys()
+        let num_tables: int = table_keys.length()
+        var total_rows: int = 0
+        for tname: String in table_keys {
+            let ids_csv: String = g_row_ids.get(tname)
+            let ids: Array = parse_rowid_list(ids_csv)
+            total_rows = total_rows + ids.length()
+        }
+        var info: String = "# nyx-db v0.1.0\r\n"
+        info = info + "tables:" + int_to_string(num_tables) + "\r\n"
+        info = info + "total_rows:" + int_to_string(total_rows) + "\r\n"
+        return resp_bulk_string(info)
+    }
+
+    // TABLES (list all tables)
+    if first == "TABLES" {
+        let table_keys: Array = g_tables.keys()
+        return resp_bulk_array(table_keys)
+    }
+
+    // SCHEMA tablename
+    if first == "SCHEMA" {
+        if cmd.length() < 2 {
+            return resp_error("usage: SCHEMA <table>")
+        }
+        let table_raw: String = cmd[1]
+        let table: String = table_raw
+        if g_schema.contains(table) == false {
+            return resp_error("table not found: " + table)
+        }
+        let schema_str: String = g_schema.get(table)
+        return resp_bulk_string(schema_str)
+    }
+
+    // COMMAND (redis-cli compatibility)
+    if first == "COMMAND" {
+        return resp_simple_string("OK")
+    }
+
+    // Everything else is SQL — join all parts into a single SQL string
+    var sql: String = ""
+    var i: int = 0
+    while i < cmd.length() {
+        if i > 0 { sql = sql + " " }
+        let part_raw: String = cmd[i]
+        let part: String = part_raw
+        sql = sql + part
+        i = i + 1
+    }
+
+    // Tokenize + Parse under mutex (parser uses global state p_tokens/p_pos)
+    db_ensure_mtx()
+    mutex_lock(g_db_mtx)
+    let tokens: Array = sql_tokenize(sql)
+    if tokens.length() == 0 {
+        mutex_unlock(g_db_mtx)
+        return resp_error("empty SQL statement")
+    }
+    let ast: Array = sql_parse(tokens)
+    mutex_unlock(g_db_mtx)
+
+    // Execute (store functions lock internally)
+    return db_execute(ast, fd)
+}

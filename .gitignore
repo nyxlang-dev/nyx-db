@@ -1,0 +1,8 @@
+nyx-db
+*.ndb
+*.wal
+script.nx
+script.ll
+packages/
+*.o
+.DS_Store
