@@ -1,0 +1,131 @@
+// test_db_planner.nx — v0.3 query planner tests (embedded mode)
+//
+// Goals:
+//   1. Semantic equivalence: reordering AND conjuncts doesn't change results.
+//   2. NOT preserves meaning (not flattened through).
+//   3. OR stays opaque (no cross-boundary reorder).
+//   4. Hoisted indexed equality returns correct rows.
+//   5. No-WHERE and single-predicate paths still work.
+
+import "std/resp"
+import "src/sql_lexer"
+import "src/sql_parser"
+import "src/btree"
+import "src/wal"
+import "src/store"
+import "src/planner"
+import "src/executor"
+import "src/persist"
+import "src/query"
+
+fn setup() {
+    db_query("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT, city TEXT)")
+    db_query("CREATE INDEX idx_city ON t (city)")
+    db_query("INSERT INTO t VALUES (1, 'Alice',   30, 'Paris')")
+    db_query("INSERT INTO t VALUES (2, 'Bob',     25, 'Lima')")
+    db_query("INSERT INTO t VALUES (3, 'Carol',   40, 'Paris')")
+    db_query("INSERT INTO t VALUES (4, 'Dave',    22, 'Tokyo')")
+    db_query("INSERT INTO t VALUES (5, 'Eve',     35, 'Lima')")
+    db_query("INSERT INTO t VALUES (6, 'Frank',   28, 'Paris')")
+    db_query("INSERT INTO t VALUES (7, 'Grace',   45, 'Lima')")
+    db_query("INSERT INTO t VALUES (8, 'Heidi',   33, 'Tokyo')")
+}
+
+fn data_len(rows: Array) -> int {
+    // rows = [header, row1, row2, ...]; we count data rows only
+    let n: int = rows.length()
+    if n == 0 { return 0 }
+    return n - 1
+}
+
+fn main() {
+    setup()
+
+    // 1. Commutativity: same result regardless of AND order
+    let a: Array = db_query_rows("SELECT name FROM t WHERE age > 25 AND name LIKE 'A%'")
+    let b: Array = db_query_rows("SELECT name FROM t WHERE name LIKE 'A%' AND age > 25")
+    assert(data_len(a) == data_len(b))
+    assert(data_len(a) == 1)  // Alice only
+    print("PASS: AND commutativity (Alice only)")
+
+    // 2. LIKE + indexed = (the hoist flow)
+    let r2: Array = db_query_rows("SELECT name FROM t WHERE name LIKE '%a%' AND id = 3")
+    assert(data_len(r2) == 1)  // Carol (id=3, has 'a' in 'Carol')
+    print("PASS: hoisted PK eq + LIKE filter")
+
+    // 3. LIKE + indexed non-PK eq (idx_city)
+    let r3: Array = db_query_rows("SELECT name FROM t WHERE age > 20 AND city = 'Paris'")
+    assert(data_len(r3) == 3)  // Alice, Carol, Frank
+    print("PASS: hoisted indexed non-PK eq (city)")
+
+    // 4. Single-predicate path (no AND) still uses hoist if indexed
+    let r4: Array = db_query_rows("SELECT name FROM t WHERE city = 'Lima'")
+    assert(data_len(r4) == 3)  // Bob, Eve, Grace
+    print("PASS: single indexed eq (no AND)")
+
+    // 5. Non-indexed single predicate
+    let r5: Array = db_query_rows("SELECT name FROM t WHERE age > 30")
+    assert(data_len(r5) == 4)  // Carol(40), Eve(35), Grace(45), Heidi(33)
+    print("PASS: single non-indexed predicate")
+
+    // 6. NOT preserved (not flattened)
+    let r6: Array = db_query_rows("SELECT name FROM t WHERE NOT (age < 30)")
+    assert(data_len(r6) == 5)  // age >= 30: Alice, Carol, Eve, Grace, Heidi
+    print("PASS: NOT preserved")
+
+    // 7. OR stays opaque — reordering inside AND must not cross OR
+    let r7: Array = db_query_rows("SELECT name FROM t WHERE city = 'Paris' OR city = 'Tokyo'")
+    assert(data_len(r7) == 5)  // Alice, Carol, Frank (Paris) + Dave, Heidi (Tokyo)
+    print("PASS: OR opaque")
+
+    // 8. Nested AND/OR: (city = 'Paris' AND age > 30) OR id = 2
+    //    Expected: Carol(city=Paris, age=40), Bob(id=2). Alice=30 fails age>30.
+    let r8: Array = db_query_rows("SELECT name FROM t WHERE (city = 'Paris' AND age > 30) OR id = 2")
+    assert(data_len(r8) == 2)
+    print("PASS: nested AND inside OR")
+
+    // 9. No WHERE — all rows
+    let r9: Array = db_query_rows("SELECT id FROM t")
+    assert(data_len(r9) == 8)
+    print("PASS: no WHERE returns all rows")
+
+    // 10. UPDATE through planner (hoisted eq narrows candidates)
+    let upd: Array = db_query("UPDATE t SET age = 99 WHERE city = 'Tokyo' AND age < 30")
+    assert(upd[0] == "OK")
+    let n_upd: int = upd[1]
+    assert(n_upd == 1)  // Only Dave (22) matches; Heidi(33) doesn't.
+    let rv: Array = db_query_rows("SELECT name FROM t WHERE age = 99")
+    assert(data_len(rv) == 1)
+    print("PASS: UPDATE with hoisted + filter")
+
+    // 11. DELETE through planner
+    let del: Array = db_query("DELETE FROM t WHERE city = 'Lima' AND age > 40")
+    assert(del[0] == "OK")
+    let n_del: int = del[1]
+    assert(n_del == 1)  // Grace(45) only — Bob(25), Eve(35) under 40
+    let rem: Array = db_query_rows("SELECT COUNT(*) FROM t WHERE city = 'Lima'")
+    let rem_count: String = rem[1][0]
+    assert(rem_count == "2")
+    print("PASS: DELETE with hoisted + filter")
+
+    // 12. Empty IN collapses to false
+    let r12: Array = db_query_rows("SELECT name FROM t WHERE age > 20 AND city IN ('Nowhere')")
+    assert(data_len(r12) == 0)
+    print("PASS: IN with non-matching value returns 0 rows")
+
+    // 13. Commutativity with 3 AND predicates
+    let q1: Array = db_query_rows("SELECT name FROM t WHERE age > 20 AND city = 'Paris' AND name LIKE '%r%'")
+    let q2: Array = db_query_rows("SELECT name FROM t WHERE name LIKE '%r%' AND city = 'Paris' AND age > 20")
+    let q3: Array = db_query_rows("SELECT name FROM t WHERE city = 'Paris' AND name LIKE '%r%' AND age > 20")
+    assert(data_len(q1) == data_len(q2))
+    assert(data_len(q2) == data_len(q3))
+    // Carol, Frank have 'r' in name and city=Paris. Alice doesn't.
+    assert(data_len(q1) == 2)
+    print("PASS: 3-way AND commutativity")
+
+    db_query("DROP TABLE t")
+
+    print("")
+    print("All planner tests passed!")
+    return 0
+}

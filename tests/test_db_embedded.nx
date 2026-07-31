@@ -1,0 +1,138 @@
+// test_db_embedded.nx — Test embedded SQL API (no server needed)
+import "std/resp"
+import "src/sql_lexer"
+import "src/sql_parser"
+import "src/btree"
+import "src/wal"
+import "src/store"
+import "src/planner"
+import "src/executor"
+import "src/persist"
+import "src/query"
+
+fn main() {
+    // CREATE TABLE
+    let r1: Array = db_query("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+    assert(r1[0] == "OK")
+    print("PASS: CREATE TABLE")
+
+    // INSERT
+    let r2: Array = db_query("INSERT INTO users VALUES (1, 'Alice', 30)")
+    assert(r2[0] == "OK")
+    let r3: Array = db_query("INSERT INTO users VALUES (2, 'Bob', 25)")
+    assert(r3[0] == "OK")
+    let r4: Array = db_query("INSERT INTO users VALUES (3, 'Charlie', 35)")
+    assert(r4[0] == "OK")
+    print("PASS: INSERT 3 rows")
+
+    // PRIMARY KEY enforcement
+    let r_dup: Array = db_query("INSERT INTO users VALUES (1, 'Duplicate', 99)")
+    assert(r_dup[0] == "ERROR")
+    print("PASS: PRIMARY KEY rejects duplicate")
+
+    // SELECT *
+    let r5: Array = db_query("SELECT * FROM users")
+    assert(r5[0] == "ROWS")
+    let rows: Array = r5[1]
+    assert(rows.length() == 4)  // header + 3 data rows
+    let header: Array = rows[0]
+    assert(header[0] == "id")
+    assert(header[1] == "name")
+    assert(header[2] == "age")
+    print("PASS: SELECT * returns header + 3 rows")
+
+    // SELECT WHERE
+    let r6: Array = db_query("SELECT name FROM users WHERE age > 28")
+    assert(r6[0] == "ROWS")
+    let filtered: Array = r6[1]
+    assert(filtered.length() == 3)  // header + Alice(30) + Charlie(35)
+    print("PASS: SELECT WHERE age > 28")
+
+    // COUNT
+    let r7: Array = db_query("SELECT COUNT(*) FROM users")
+    assert(r7[0] == "ROWS")
+    let count_rows: Array = r7[1]
+    let count_val: String = count_rows[1][0]
+    assert(count_val == "3")
+    print("PASS: COUNT(*) = 3")
+
+    // AVG (float)
+    let r8: Array = db_query("SELECT AVG(age) FROM users")
+    assert(r8[0] == "ROWS")
+    let avg_rows: Array = r8[1]
+    let avg_val: String = avg_rows[1][0]
+    // (30 + 25 + 35) / 3 = 30.0
+    assert(avg_val.startsWith("30"))
+    print("PASS: AVG(age) = " + avg_val)
+
+    // UPDATE
+    let r9: Array = db_query("UPDATE users SET age = 31 WHERE name = 'Alice'")
+    assert(r9[0] == "OK")
+    let updated: int = r9[1]
+    assert(updated == 1)
+    print("PASS: UPDATE 1 row")
+
+    // DELETE
+    let r10: Array = db_query("DELETE FROM users WHERE name = 'Charlie'")
+    assert(r10[0] == "OK")
+    let deleted: int = r10[1]
+    assert(deleted == 1)
+    print("PASS: DELETE 1 row")
+
+    // Verify count after delete
+    let r11: Array = db_query("SELECT COUNT(*) FROM users")
+    let final_count: String = r11[1][1][0]
+    assert(final_count == "2")
+    print("PASS: COUNT after delete = 2")
+
+    // db_query_rows convenience
+    let qr: Array = db_query_rows("SELECT name, age FROM users ORDER BY age ASC")
+    assert(qr.length() == 3)  // header + 2 rows
+    let first_name: String = qr[1][0]
+    assert(first_name == "Bob")
+    print("PASS: db_query_rows ORDER BY")
+
+    // GROUP BY
+    db_query("CREATE TABLE scores (name TEXT, subject TEXT, score INT)")
+    db_query("INSERT INTO scores VALUES ('Alice', 'math', 90)")
+    db_query("INSERT INTO scores VALUES ('Alice', 'science', 85)")
+    db_query("INSERT INTO scores VALUES ('Bob', 'math', 70)")
+    db_query("INSERT INTO scores VALUES ('Bob', 'science', 80)")
+    db_query("INSERT INTO scores VALUES ('Charlie', 'math', 95)")
+
+    let rg: Array = db_query("SELECT name, COUNT(*), SUM(score), AVG(score) FROM scores GROUP BY name")
+    assert(rg[0] == "ROWS")
+    let grow: Array = rg[1]
+    assert(grow.length() == 4)  // header + 3 groups
+    let gh: Array = grow[0]
+    assert(gh[0] == "name")
+    assert(gh[1] == "COUNT(*)")
+    print("PASS: GROUP BY with aggregates")
+
+    // DISTINCT
+    db_query("INSERT INTO scores VALUES ('Alice', 'math', 90)")  // duplicate
+    let rd: Array = db_query("SELECT DISTINCT name FROM scores")
+    assert(rd[0] == "ROWS")
+    let drows: Array = rd[1]
+    assert(drows.length() == 4)  // header + Alice, Bob, Charlie
+    print("PASS: SELECT DISTINCT")
+
+    // ORDER BY merge sort (already tested above, just verify large set)
+    let ro: Array = db_query("SELECT name, score FROM scores ORDER BY score DESC")
+    assert(ro[0] == "ROWS")
+    let orows: Array = ro[1]
+    let first_score: String = orows[1][1]
+    assert(first_score == "95")
+    print("PASS: ORDER BY DESC (merge sort)")
+
+    db_query("DROP TABLE scores")
+
+    // DROP TABLE
+    let r12: Array = db_query("DROP TABLE users")
+    assert(r12[0] == "OK")
+    print("PASS: DROP TABLE")
+
+    print("")
+    print("All embedded DB tests passed!")
+    return 0
+}

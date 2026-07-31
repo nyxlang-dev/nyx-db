@@ -1,0 +1,102 @@
+// test_db_having.nx — HAVING clause over GROUP BY with aggregate predicates.
+
+import "std/resp"
+import "src/sql_lexer"
+import "src/sql_parser"
+import "src/btree"
+import "src/wal"
+import "src/store"
+import "src/planner"
+import "src/executor"
+import "src/persist"
+import "src/query"
+
+fn data_len(rows: Array) -> int {
+    let n: int = rows.length()
+    if n == 0 { return 0 }
+    return n - 1
+}
+
+fn main() {
+    db_query("CREATE TABLE scores (name TEXT, subject TEXT, score INT)")
+    // Alice: math 90, science 85 -> count=2, sum=175, avg=87.5
+    // Bob:   math 70, science 80 -> count=2, sum=150, avg=75
+    // Carol: math 95              -> count=1, sum=95,  avg=95
+    // Dave:  math 50, science 55, history 60 -> count=3, sum=165, avg=55
+    db_query("INSERT INTO scores VALUES ('Alice', 'math', 90)")
+    db_query("INSERT INTO scores VALUES ('Alice', 'science', 85)")
+    db_query("INSERT INTO scores VALUES ('Bob', 'math', 70)")
+    db_query("INSERT INTO scores VALUES ('Bob', 'science', 80)")
+    db_query("INSERT INTO scores VALUES ('Carol', 'math', 95)")
+    db_query("INSERT INTO scores VALUES ('Dave', 'math', 50)")
+    db_query("INSERT INTO scores VALUES ('Dave', 'science', 55)")
+    db_query("INSERT INTO scores VALUES ('Dave', 'history', 60)")
+    print("PASS: seeded 4 students")
+
+    // ── 1. Baseline: no HAVING — 4 groups ─────────────────────────
+    let r0: Array = db_query_rows("SELECT name, COUNT(*) FROM scores GROUP BY name")
+    assert(data_len(r0) == 4)
+    print("PASS: GROUP BY without HAVING returns all groups")
+
+    // ── 2. HAVING COUNT(*) > 1 → excludes Carol (only 1 row) ──────
+    let r1: Array = db_query_rows("SELECT name, COUNT(*) FROM scores GROUP BY name HAVING COUNT(*) > 1")
+    assert(data_len(r1) == 3)  // Alice, Bob, Dave
+    print("PASS: HAVING COUNT(*) > 1 filters singleton groups")
+
+    // ── 3. HAVING COUNT(*) = 1 → only Carol ───────────────────────
+    let r2: Array = db_query_rows("SELECT name, COUNT(*) FROM scores GROUP BY name HAVING COUNT(*) = 1")
+    assert(data_len(r2) == 1)
+    let r2_row: Array = r2[1]
+    let r2_name: String = r2_row[0]
+    assert(r2_name == "Carol")
+    print("PASS: HAVING COUNT(*) = 1 isolates Carol")
+
+    // ── 4. HAVING SUM(score) > 150 → Alice(175), Dave(165) ────────
+    let r3: Array = db_query_rows("SELECT name, SUM(score) FROM scores GROUP BY name HAVING SUM(score) > 150")
+    assert(data_len(r3) == 2)
+    print("PASS: HAVING SUM(score) > 150 -> 2 groups (Alice, Dave)")
+
+    // ── 5. HAVING AVG(score) >= 87 → only Alice(87.5), Carol(95) ──
+    let r4: Array = db_query_rows("SELECT name, AVG(score) FROM scores GROUP BY name HAVING AVG(score) >= 87")
+    assert(data_len(r4) == 2)
+    print("PASS: HAVING AVG(score) >= 87 -> Alice + Carol")
+
+    // ── 6. HAVING on non-aggregate (group col) — SQL permits it ──
+    let r5: Array = db_query_rows("SELECT name, COUNT(*) FROM scores GROUP BY name HAVING name = 'Bob'")
+    assert(data_len(r5) == 1)
+    let r5_row: Array = r5[1]
+    let r5_name: String = r5_row[0]
+    assert(r5_name == "Bob")
+    print("PASS: HAVING on non-aggregate column")
+
+    // ── 7. HAVING with AND combining two aggregates ──────────────
+    // Count > 1 AND sum > 150 → Alice(2,175), Dave(3,165). Bob(2,150) excluded.
+    let r6: Array = db_query_rows("SELECT name, COUNT(*), SUM(score) FROM scores GROUP BY name HAVING COUNT(*) > 1 AND SUM(score) > 150")
+    assert(data_len(r6) == 2)
+    print("PASS: HAVING COUNT(*) > 1 AND SUM(score) > 150")
+
+    // ── 8. HAVING that filters everything out ────────────────────
+    let r7: Array = db_query_rows("SELECT name, COUNT(*) FROM scores GROUP BY name HAVING COUNT(*) > 1000")
+    assert(data_len(r7) == 0)
+    print("PASS: HAVING that matches no groups returns 0 rows")
+
+    // ── 9. WHERE + GROUP BY + HAVING interplay ───────────────────
+    // WHERE subject = 'math' narrows to math rows per student,
+    // then GROUP BY name with HAVING COUNT(*) > 0 (trivially true).
+    // Alice, Bob, Carol, Dave all have exactly one math entry.
+    let r8: Array = db_query_rows("SELECT name, COUNT(*) FROM scores WHERE subject = 'math' GROUP BY name HAVING COUNT(*) > 0")
+    assert(data_len(r8) == 4)
+    print("PASS: WHERE + GROUP BY + HAVING combined")
+
+    // ── 10. HAVING MIN(score) and MAX(score) ─────────────────────
+    // Dave min=50; others min >= 70. HAVING MIN(score) < 60 → only Dave(min=50).
+    let r9: Array = db_query_rows("SELECT name, MIN(score) FROM scores GROUP BY name HAVING MIN(score) < 60")
+    assert(data_len(r9) == 1)
+    print("PASS: HAVING MIN(score) < 60 -> only Dave")
+
+    db_query("DROP TABLE scores")
+
+    print("")
+    print("All HAVING tests passed!")
+    return 0
+}

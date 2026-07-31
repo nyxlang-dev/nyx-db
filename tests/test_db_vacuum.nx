@@ -1,0 +1,136 @@
+// test_db_vacuum.nx — VACUUM compacta tombstones BTREE (v0.5).
+//
+// Tombstones acumulados por DELETEs sobre una columna BTREE-indexada
+// dejan keys con CSV vacío en el árbol. VACUUM reconstruye el índice
+// eliminando esos slots. Este test verifica:
+//   1. VACUUM sin BTREE es no-op seguro.
+//   2. Delete + VACUUM reporta la cantidad correcta de tombstones.
+//   3. Lookups post-VACUUM siguen correctos (exactos y range).
+//   4. VACUUM <table> solo afecta a esa tabla.
+//   5. VACUUM sobre tabla inexistente devuelve error.
+//   6. Reinsertar keys previamente tombstoneados funciona.
+//   7. Secondary index con duplicados (mismo age distinto id) no
+//      cuenta como tombstone mientras quede un rowid vivo.
+
+import "std/resp"
+import "src/sql_lexer"
+import "src/sql_parser"
+import "src/btree"
+import "src/wal"
+import "src/store"
+import "src/planner"
+import "src/executor"
+import "src/persist"
+import "src/query"
+
+fn data_len(rows: Array) -> int {
+    let n: int = rows.length()
+    if n == 0 { return 0 }
+    return n - 1
+}
+
+fn main() {
+    // ── Setup: tabla con índice HASH + BTREE ─────────────────────────
+    db_query("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)")
+    let h: Array = db_query("CREATE INDEX idx_name ON t (name)")
+    assert(h[0] == "OK")
+    let b: Array = db_query("CREATE INDEX idx_age ON t (age) USING BTREE")
+    assert(b[0] == "OK")
+
+    var i: int = 1
+    while i <= 30 {
+        let name: String = "user" + int_to_string(i)
+        db_query("INSERT INTO t VALUES (" + int_to_string(i) + ", '" + name + "', " + int_to_string(i) + ")")
+        i = i + 1
+    }
+    print("PASS: setup 30 rows")
+
+    // ── 1. VACUUM sin deletes: 0 tombstones ──────────────────────────
+    let v0: Array = db_query("VACUUM t")
+    assert(v0[0] == "OK")
+    let removed0: int = v0[1]
+    assert(removed0 == 0)
+    print("PASS: VACUUM without deletes = 0 removed")
+
+    // ── 2. DELETE 10 rows con ages únicos → 10 tombstones BTREE ──────
+    db_query("DELETE FROM t WHERE age >= 21 AND age <= 30")
+    let cnt_after_del: Array = db_query_rows("SELECT id FROM t")
+    assert(data_len(cnt_after_del) == 20)
+    print("PASS: deleted 10 rows, 20 remaining")
+
+    let v1: Array = db_query("VACUUM t")
+    assert(v1[0] == "OK")
+    let removed1: int = v1[1]
+    assert(removed1 == 10)
+    print("PASS: VACUUM t removed 10 tombstones")
+
+    // ── 3. Lookups post-VACUUM: exact + range siguen correctos ──────
+    let r_eq: Array = db_query_rows("SELECT id FROM t WHERE age = 15")
+    assert(data_len(r_eq) == 1)
+    print("PASS: exact lookup post-VACUUM")
+
+    let r_range: Array = db_query_rows("SELECT id FROM t WHERE age > 5 AND age < 15")
+    assert(data_len(r_range) == 9)  // ages 6..14
+    print("PASS: range scan post-VACUUM")
+
+    let r_missing: Array = db_query_rows("SELECT id FROM t WHERE age = 25")
+    assert(data_len(r_missing) == 0)
+    print("PASS: deleted key still absent post-VACUUM")
+
+    // ── 4. Reinsertar key previamente tombstoneado ───────────────────
+    db_query("INSERT INTO t VALUES (100, 'revenant', 25)")
+    let r_back: Array = db_query_rows("SELECT id FROM t WHERE age = 25")
+    assert(data_len(r_back) == 1)
+    print("PASS: reinsert of previously-tombstoned key works")
+
+    // ── 5. VACUUM sin nombre de tabla: pasa por todos los índices ────
+    db_query("DELETE FROM t WHERE id = 100")
+    let v_all: Array = db_query("VACUUM")
+    assert(v_all[0] == "OK")
+    let removed_all: int = v_all[1]
+    assert(removed_all == 1)
+    print("PASS: VACUUM (no table) removed 1")
+
+    // ── 6. VACUUM tabla inexistente ──────────────────────────────────
+    let v_bad: Array = db_query("VACUUM nonexistent")
+    assert(v_bad[0] == "ERROR")
+    print("PASS: VACUUM on unknown table reports error")
+
+    // ── 7. Duplicates en BTREE: delete parcial NO tombstonea el key ──
+    // Tabla nueva con ages no-unique. Borrar 1 de 3 ids con age=10 debe
+    // dejar la key viva (CSV no vacío). VACUUM cuenta 0.
+    db_query("CREATE TABLE t2 (id INT PRIMARY KEY, age INT)")
+    db_query("CREATE INDEX idx_t2_age ON t2 (age) USING BTREE")
+    db_query("INSERT INTO t2 VALUES (1, 10)")
+    db_query("INSERT INTO t2 VALUES (2, 10)")
+    db_query("INSERT INTO t2 VALUES (3, 10)")
+    db_query("DELETE FROM t2 WHERE id = 2")
+    let v_dup: Array = db_query("VACUUM t2")
+    assert(v_dup[0] == "OK")
+    let removed_dup: int = v_dup[1]
+    assert(removed_dup == 0)
+    let r_dup: Array = db_query_rows("SELECT id FROM t2 WHERE age = 10")
+    assert(data_len(r_dup) == 2)
+    print("PASS: partial delete keeps key alive (no tombstone)")
+
+    // Borrar los dos restantes → un tombstone.
+    db_query("DELETE FROM t2 WHERE age = 10")
+    let v_dup2: Array = db_query("VACUUM t2")
+    let removed_dup2: int = v_dup2[1]
+    assert(removed_dup2 == 1)
+    print("PASS: full-key delete counts as 1 tombstone")
+
+    // ── 8. Tabla sin BTREE (solo HASH): VACUUM es no-op ──────────────
+    db_query("CREATE TABLE h (id INT PRIMARY KEY, tag TEXT)")
+    db_query("CREATE INDEX idx_h_tag ON h (tag)")
+    db_query("INSERT INTO h VALUES (1, 'a')")
+    db_query("DELETE FROM h WHERE id = 1")
+    let v_hash: Array = db_query("VACUUM h")
+    assert(v_hash[0] == "OK")
+    let removed_hash: int = v_hash[1]
+    assert(removed_hash == 0)
+    print("PASS: VACUUM on HASH-only table is no-op")
+
+    print("")
+    print("=== ALL VACUUM TESTS PASSED ===")
+}

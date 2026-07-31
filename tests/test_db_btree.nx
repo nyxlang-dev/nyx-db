@@ -1,0 +1,131 @@
+// test_db_btree.nx — Integration tests for BTREE secondary indices (v0.4).
+// Exercises CREATE INDEX ... USING BTREE end-to-end through the SQL
+// surface, with range predicates that the planner hoists via the B-tree.
+
+import "std/resp"
+import "src/sql_lexer"
+import "src/sql_parser"
+import "src/btree"
+import "src/wal"
+import "src/store"
+import "src/planner"
+import "src/executor"
+import "src/persist"
+import "src/query"
+
+fn data_len(rows: Array) -> int {
+    let n: int = rows.length()
+    if n == 0 { return 0 }
+    return n - 1
+}
+
+fn main() {
+    // ── Setup ──────────────────────────────────────────────────────
+    db_query("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)")
+    // Hash index on name (back-compat: no USING clause).
+    let h: Array = db_query("CREATE INDEX idx_name ON t (name)")
+    assert(h[0] == "OK")
+    // B-tree index on age — v0.4 syntax.
+    let b: Array = db_query("CREATE INDEX idx_age ON t (age) USING BTREE")
+    assert(b[0] == "OK")
+    print("PASS: CREATE INDEX HASH + BTREE")
+
+    // Seed 50 rows, ages 1..50.
+    var i: int = 1
+    while i <= 50 {
+        let name: String = "user" + int_to_string(i)
+        db_query("INSERT INTO t VALUES (" + int_to_string(i) + ", '" + name + "', " + int_to_string(i) + ")")
+        i = i + 1
+    }
+    print("PASS: seeded 50 rows")
+
+    // ── Exact lookup via HASH (back-compat) ────────────────────────
+    let r_hash: Array = db_query_rows("SELECT id FROM t WHERE name = 'user7'")
+    assert(data_len(r_hash) == 1)
+    print("PASS: HASH exact lookup")
+
+    // ── Exact lookup via BTREE ────────────────────────────────────
+    let r_bt_eq: Array = db_query_rows("SELECT id FROM t WHERE age = 25")
+    assert(data_len(r_bt_eq) == 1)
+    print("PASS: BTREE exact lookup (age = 25)")
+
+    // ── Range > via BTREE ──────────────────────────────────────────
+    let r_gt: Array = db_query_rows("SELECT id FROM t WHERE age > 40")
+    assert(data_len(r_gt) == 10)  // 41..50
+    print("PASS: BTREE age > 40 -> 10 rows")
+
+    // ── Range >= via BTREE ─────────────────────────────────────────
+    let r_ge: Array = db_query_rows("SELECT id FROM t WHERE age >= 40")
+    assert(data_len(r_ge) == 11)  // 40..50
+    print("PASS: BTREE age >= 40 -> 11 rows")
+
+    // ── Range < via BTREE ──────────────────────────────────────────
+    let r_lt: Array = db_query_rows("SELECT id FROM t WHERE age < 5")
+    assert(data_len(r_lt) == 4)  // 1..4
+    print("PASS: BTREE age < 5 -> 4 rows")
+
+    // ── BETWEEN via BTREE ─────────────────────────────────────────
+    let r_bw: Array = db_query_rows("SELECT id FROM t WHERE age BETWEEN 10 AND 20")
+    assert(data_len(r_bw) == 11)  // 10..20
+    print("PASS: BTREE BETWEEN 10 AND 20")
+
+    // ── Compound: BTREE range + non-indexed predicate ─────────────
+    // age > 20 AND name LIKE '%5' → age 21..50 with names ending in "5":
+    //   user25, user35, user45 — i.e. 3 rows (user15 is excluded by age>20).
+    let r_mix: Array = db_query_rows("SELECT id FROM t WHERE age > 20 AND name LIKE '%5'")
+    assert(data_len(r_mix) == 3)
+    print("PASS: BTREE range + LIKE mixed")
+
+    // ── Range fusion: age > 10 AND age < 20 → fused RANGE hoist ───
+    let r_fuse: Array = db_query_rows("SELECT id FROM t WHERE age > 10 AND age < 20")
+    assert(data_len(r_fuse) == 9)  // 11..19
+    print("PASS: range fusion (age > 10 AND age < 20)")
+
+    // ── Range fusion with inclusivity ─────────────────────────────
+    let r_fuse2: Array = db_query_rows("SELECT id FROM t WHERE age >= 10 AND age <= 20")
+    assert(data_len(r_fuse2) == 11)  // 10..20
+    print("PASS: range fusion inclusive (>=10 AND <=20)")
+
+    // ── UPDATE via BTREE hoist ────────────────────────────────────
+    // Set all rows with age in [45, 48] to have age = 100.
+    let u: Array = db_query("UPDATE t SET age = 100 WHERE age BETWEEN 45 AND 48")
+    assert(u[0] == "OK")
+    let u_count: int = u[1]
+    assert(u_count == 4)
+    // After update, age=100 should return 4 rows.
+    let r_after_u: Array = db_query_rows("SELECT id FROM t WHERE age = 100")
+    assert(data_len(r_after_u) == 4)
+    // And age BETWEEN 45 AND 48 should now be empty.
+    let r_empty: Array = db_query_rows("SELECT id FROM t WHERE age BETWEEN 45 AND 48")
+    assert(data_len(r_empty) == 0)
+    print("PASS: UPDATE via BTREE hoist preserves index")
+
+    // ── DELETE via BTREE hoist ────────────────────────────────────
+    // Delete rows with age < 5 (should remove 4: ages 1..4).
+    let d: Array = db_query("DELETE FROM t WHERE age < 5")
+    assert(d[0] == "OK")
+    let d_count: int = d[1]
+    assert(d_count == 4)
+    // age < 10 should now return 5 rows (5..9).
+    let r_after_d: Array = db_query_rows("SELECT id FROM t WHERE age < 10")
+    assert(data_len(r_after_d) == 5)
+    print("PASS: DELETE via BTREE hoist preserves index")
+
+    // ── BTREE with TEXT col ordering ─────────────────────────────
+    db_query("CREATE TABLE words (w TEXT)")
+    db_query("CREATE INDEX idx_w ON words (w) USING BTREE")
+    db_query("INSERT INTO words VALUES ('banana')")
+    db_query("INSERT INTO words VALUES ('apple')")
+    db_query("INSERT INTO words VALUES ('cherry')")
+    db_query("INSERT INTO words VALUES ('date')")
+    let r_text: Array = db_query_rows("SELECT w FROM words WHERE w BETWEEN 'b' AND 'd'")
+    assert(data_len(r_text) == 2)  // banana, cherry
+    print("PASS: BTREE on TEXT column")
+
+    db_query("DROP TABLE words")
+    db_query("DROP TABLE t")
+
+    print("")
+    print("All BTREE integration tests passed!")
+    return 0
+}

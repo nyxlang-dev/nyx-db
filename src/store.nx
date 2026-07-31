@@ -15,10 +15,17 @@ var g_index_kind: Map = Map.new()     // "tablename::colname" -> "HASH"|"BTREE"
 var g_index_btree_id: Map = Map.new() // "tablename::colname" -> tree_id string (BTREE kind)
 var g_changes: int = 0
 var g_db_mtx: Map = Map.new()
+// RWLock del STORE (campaña 2026-07-21 C3): SELECT toma rdlock (lecturas
+// concurrentes reales — db_select y los lookups de índice/btree son
+// read-only), las mutaciones (CREATE/DROP/INSERT/UPDATE/DELETE/INDEX/
+// VACUUM) toman wrlock. g_db_mtx queda SOLO para el parser (p_tokens/p_pos
+// son globales → parse exclusivo, en query.nx/commands.nx).
+var g_db_rw: Map = Map.new()
 
 fn db_ensure_mtx() {
     if g_db_mtx.size() == 0 {
         g_db_mtx = mutex_new()
+        g_db_rw = rwlock_new()
     }
 }
 
@@ -290,9 +297,9 @@ fn remove_indices_for_row(table: String, schema: Array, values: Array, rowid: in
 
 fn db_create_table(name: String, col_defs: Array) -> String {
     db_ensure_mtx()
-    mutex_lock(g_db_mtx)
+    rwlock_wrlock(g_db_rw)
     if g_tables.contains(name) {
-        mutex_unlock(g_db_mtx)
+        rwlock_unlock(g_db_rw)
         return "table already exists: " + name
     }
 
@@ -321,15 +328,15 @@ fn db_create_table(name: String, col_defs: Array) -> String {
     g_next_rowid.insert(name, 1)
     g_row_ids.insert(name, "")
     g_changes = g_changes + 1
-    mutex_unlock(g_db_mtx)
+    rwlock_unlock(g_db_rw)
     return ""
 }
 
 fn db_drop_table(name: String) -> String {
     db_ensure_mtx()
-    mutex_lock(g_db_mtx)
+    rwlock_wrlock(g_db_rw)
     if g_tables.contains(name) == false {
-        mutex_unlock(g_db_mtx)
+        rwlock_unlock(g_db_rw)
         return "table not found: " + name
     }
 
@@ -364,15 +371,15 @@ fn db_drop_table(name: String) -> String {
     g_next_rowid.remove(name)
     g_row_ids.remove(name)
     g_changes = g_changes + 1
-    mutex_unlock(g_db_mtx)
+    rwlock_unlock(g_db_rw)
     return ""
 }
 
 fn db_insert(table: String, cols: Array, value_rows: Array) -> Array {
     db_ensure_mtx()
-    mutex_lock(g_db_mtx)
+    rwlock_wrlock(g_db_rw)
     if g_tables.contains(table) == false {
-        mutex_unlock(g_db_mtx)
+        rwlock_unlock(g_db_rw)
         return ["ERROR", "table not found: " + table]
     }
 
@@ -437,7 +444,7 @@ fn db_insert(table: String, cols: Array, value_rows: Array) -> Array {
                         if existing_pk == pk_val {
                             let pk_entry: Array = schema[pk_idx]
                             let pk_name: String = pk_entry[0]
-                            mutex_unlock(g_db_mtx)
+                            rwlock_unlock(g_db_rw)
                             return ["ERROR", "UNIQUE constraint failed: " + table + "." + pk_name]
                         }
                     }
@@ -469,7 +476,7 @@ fn db_insert(table: String, cols: Array, value_rows: Array) -> Array {
         g_changes = g_changes + 1
     }
 
-    mutex_unlock(g_db_mtx)
+    rwlock_unlock(g_db_rw)
     return ["OK", inserted]
 }
 
@@ -713,9 +720,9 @@ fn merge_rows(left: Array, right: Array, col_idx: int, col_type: String, dir: St
 
 fn db_select(table: String, cols: Array, where_ast: Array, order_ast: Array, limit: int, offset: int, join_ast: Array) -> Array {
     db_ensure_mtx()
-    mutex_lock(g_db_mtx)
+    rwlock_rdlock(g_db_rw)
     if g_tables.contains(table) == false {
-        mutex_unlock(g_db_mtx)
+        rwlock_unlock(g_db_rw)
         return ["ERROR", "table not found: " + table]
     }
 
@@ -932,7 +939,7 @@ fn db_select(table: String, cols: Array, where_ast: Array, order_ast: Array, lim
         pi = pi + 1
     }
 
-    mutex_unlock(g_db_mtx)
+    rwlock_unlock(g_db_rw)
     return ["OK", projected, use_schema]
 }
 
@@ -940,9 +947,9 @@ fn db_select(table: String, cols: Array, where_ast: Array, order_ast: Array, lim
 
 fn db_update(table: String, sets: Array, where_ast: Array) -> Array {
     db_ensure_mtx()
-    mutex_lock(g_db_mtx)
+    rwlock_wrlock(g_db_rw)
     if g_tables.contains(table) == false {
-        mutex_unlock(g_db_mtx)
+        rwlock_unlock(g_db_rw)
         return ["ERROR", "table not found: " + table]
     }
 
@@ -1012,7 +1019,7 @@ fn db_update(table: String, sets: Array, where_ast: Array) -> Array {
         }
     }
 
-    mutex_unlock(g_db_mtx)
+    rwlock_unlock(g_db_rw)
     return ["OK", updated]
 }
 
@@ -1020,9 +1027,9 @@ fn db_update(table: String, sets: Array, where_ast: Array) -> Array {
 
 fn db_delete(table: String, where_ast: Array) -> Array {
     db_ensure_mtx()
-    mutex_lock(g_db_mtx)
+    rwlock_wrlock(g_db_rw)
     if g_tables.contains(table) == false {
-        mutex_unlock(g_db_mtx)
+        rwlock_unlock(g_db_rw)
         return ["ERROR", "table not found: " + table]
     }
 
@@ -1059,7 +1066,7 @@ fn db_delete(table: String, where_ast: Array) -> Array {
     }
 
     g_row_ids.insert(table, rowid_list_to_csv(remaining_ids))
-    mutex_unlock(g_db_mtx)
+    rwlock_unlock(g_db_rw)
     return ["OK", deleted]
 }
 
@@ -1067,9 +1074,9 @@ fn db_delete(table: String, where_ast: Array) -> Array {
 
 fn db_create_index(idx_name: String, table: String, col: String, kind: String) -> String {
     db_ensure_mtx()
-    mutex_lock(g_db_mtx)
+    rwlock_wrlock(g_db_rw)
     if g_tables.contains(table) == false {
-        mutex_unlock(g_db_mtx)
+        rwlock_unlock(g_db_rw)
         return "table not found: " + table
     }
 
@@ -1094,7 +1101,7 @@ fn db_create_index(idx_name: String, table: String, col: String, kind: String) -
     let schema: Array = schema_parse(schema_str)
     let ci: int = schema_col_index(schema, col)
     if ci < 0 {
-        mutex_unlock(g_db_mtx)
+        rwlock_unlock(g_db_rw)
         return "column not found: " + col
     }
 
@@ -1110,7 +1117,7 @@ fn db_create_index(idx_name: String, table: String, col: String, kind: String) -
     }
 
     g_changes = g_changes + 1
-    mutex_unlock(g_db_mtx)
+    rwlock_unlock(g_db_rw)
     return ""
 }
 
@@ -1141,9 +1148,9 @@ fn index_vacuum(table: String, col: String) -> int {
 // or -1 if the table does not exist.
 pub fn db_vacuum_table(table: String) -> int {
     db_ensure_mtx()
-    mutex_lock(g_db_mtx)
+    rwlock_wrlock(g_db_rw)
     if g_tables.contains(table) == false {
-        mutex_unlock(g_db_mtx)
+        rwlock_unlock(g_db_rw)
         return -1
     }
     var total: int = 0
@@ -1159,7 +1166,7 @@ pub fn db_vacuum_table(table: String) -> int {
         }
     }
     g_changes = g_changes + 1
-    mutex_unlock(g_db_mtx)
+    rwlock_unlock(g_db_rw)
     return total
 }
 
@@ -1341,7 +1348,7 @@ pub fn wal_apply_create_index(table: String, col: String, kind: String) {
 // VACUUM every BTREE index in the database.
 pub fn db_vacuum_all() -> int {
     db_ensure_mtx()
-    mutex_lock(g_db_mtx)
+    rwlock_wrlock(g_db_rw)
     var total: int = 0
     let def_keys: Array = g_index_def.keys()
     for dk: String in def_keys {
@@ -1353,6 +1360,6 @@ pub fn db_vacuum_all() -> int {
         }
     }
     g_changes = g_changes + 1
-    mutex_unlock(g_db_mtx)
+    rwlock_unlock(g_db_rw)
     return total
 }

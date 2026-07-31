@@ -1,0 +1,174 @@
+// test_db_wal.nx — WAL append + crash recovery (v0.5).
+//
+// Strategy: drive mutations through the embedded API while WAL is
+// active, then simulate a crash by wiping all in-memory state and
+// replaying the WAL from disk. The replayed state must equal the
+// pre-crash state.
+
+import "std/resp"
+import "src/sql_lexer"
+import "src/sql_parser"
+import "src/btree"
+import "src/wal"
+import "src/store"
+import "src/planner"
+import "src/executor"
+import "src/persist"
+import "src/query"
+
+fn data_len(rows: Array) -> int {
+    let n: int = rows.length()
+    if n == 0 { return 0 }
+    return n - 1
+}
+
+// Truncate the given path to an empty (but parseable) state by
+// overwriting it with just the WAL header. Works around the absence
+// of a generic remove_file primitive in the Nyx runtime.
+fn wal_reset_file(path: String) {
+    let f: Map = file_open(path, "wb")
+    let buf: Array = [78, 89, 88, 87, 1]  // "NYXW" + version
+    file_write_bytes(f, buf)
+    file_flush(f)
+    file_close(f)
+}
+
+// Wipe every global the recovery path is supposed to rebuild. Simulates
+// a fresh process coming up after a crash.
+fn crash_simulate() {
+    g_tables = Map.new()
+    g_schema = Map.new()
+    g_next_rowid = Map.new()
+    g_rows = Map.new()
+    g_row_ids = Map.new()
+    g_index_def = Map.new()
+    g_index_data = Map.new()
+    g_index_kind = Map.new()
+    g_index_btree_id = Map.new()
+    g_changes = 0
+    g_bti_nodes = Map.new()
+    g_bti_roots = Map.new()
+    g_bti_next_node = Map.new()
+    g_bti_next_tree = Map.new()
+}
+
+fn main() {
+    let wal_path: String = "/tmp/nyx_wal_unit_test.wal"
+
+    // Clean slate.
+    wal_reset_file(wal_path)
+
+    // ── 1. Append flow: each mutator produces a record ──────────────
+    wal_init(wal_path)
+    db_query("CREATE TABLE u (id INT PRIMARY KEY, name TEXT, age INT)")
+    db_query("INSERT INTO u VALUES (1, 'alice', 30)")
+    db_query("INSERT INTO u VALUES (2, 'bob', 25)")
+    db_query("INSERT INTO u VALUES (3, 'carol', 28)")
+    db_query("UPDATE u SET age = 31 WHERE name = 'alice'")
+    db_query("DELETE FROM u WHERE name = 'bob'")
+    let before: Array = db_query_rows("SELECT id, name, age FROM u")
+    assert(data_len(before) == 2)
+    print("PASS: pre-crash state has 2 rows")
+
+    // WAL file should now hold header + 6 records (varying sizes).
+    assert(file_exists(wal_path))
+    print("PASS: WAL file created")
+
+    // ── 2. Crash simulation: wipe memory, reload WAL ────────────────
+    crash_simulate()
+
+    // After crash the table shouldn't exist.
+    let missing: Array = db_query("SELECT id FROM u")
+    assert(missing[0] == "ERROR")
+    print("PASS: post-crash memory is empty")
+
+    // Replay directly (bypass persist.db_recover_from_wal to avoid the
+    // snapshot+truncate side-effect that this unit test doesn't need).
+    let stats: Array = wal_replay(wal_path)
+    let applied: int = stats[1]
+    let skipped: int = stats[2]
+    assert(applied == 6)
+    assert(skipped == 0)
+    print("PASS: replayed 6 records")
+
+    // ── 3. Recovered state matches pre-crash ─────────────────────────
+    let after: Array = db_query_rows("SELECT id, name, age FROM u")
+    assert(data_len(after) == 2)
+    print("PASS: post-replay has same 2 rows")
+
+    let alice: Array = db_query_rows("SELECT age FROM u WHERE name = 'alice'")
+    assert(data_len(alice) == 1)
+    let arow: Array = alice[1]
+    assert(arow[0] == "31")
+    print("PASS: alice.age = 31 survived update + replay")
+
+    let bob: Array = db_query_rows("SELECT id FROM u WHERE name = 'bob'")
+    assert(data_len(bob) == 0)
+    print("PASS: bob still deleted after replay")
+
+    // ── 4. CREATE INDEX survives replay + backfills from replayed rows ──
+    db_query("CREATE INDEX idx_age ON u (age) USING BTREE")
+    db_query("INSERT INTO u VALUES (4, 'dana', 35)")
+    let range_before: Array = db_query_rows("SELECT id FROM u WHERE age > 29")
+    // alice(31), dana(35) → 2 rows.
+    assert(data_len(range_before) == 2)
+
+    crash_simulate()
+    let stats2: Array = wal_replay(wal_path)
+    let applied2: int = stats2[1]
+    // replayed: CREATE + 3 INSERTs + UPDATE + DELETE + CREATE_INDEX + 1 INSERT = 8
+    assert(applied2 == 8)
+    let range_after: Array = db_query_rows("SELECT id FROM u WHERE age > 29")
+    assert(data_len(range_after) == 2)
+    print("PASS: BTREE index rebuilt from WAL, range query still works")
+
+    // ── 5. Torn-write simulation: truncate WAL mid-record ────────────
+    // Read the file, truncate last 3 bytes, write back. The last record
+    // should be skipped, everything before preserved.
+    let f1: Map = file_open(wal_path, "rb")
+    file_seek(f1, 0, 2)
+    let fsize: int = file_tell(f1)
+    file_seek(f1, 0, 0)
+    let full: Array = file_read_bytes(f1, fsize)
+    file_close(f1)
+
+    let truncated: Array = []
+    var i: int = 0
+    while i < full.length() - 3 {
+        truncated.push(full[i])
+        i = i + 1
+    }
+    let torn_path: String = "/tmp/nyx_wal_torn.wal"
+    let f2: Map = file_open(torn_path, "wb")
+    file_write_bytes(f2, truncated)
+    file_flush(f2)
+    file_close(f2)
+
+    crash_simulate()
+    let torn_stats: Array = wal_replay(torn_path)
+    let torn_applied: int = torn_stats[1]
+    let torn_skipped: int = torn_stats[2]
+    assert(torn_skipped == 1)
+    assert(torn_applied < 8)  // last record lost
+    print("PASS: torn-write detected and skipped cleanly")
+
+    // ── 6. Empty/missing WAL is a no-op ─────────────────────────────
+    let empty_stats: Array = wal_replay("/tmp/nyx_wal_nonexistent_xyz.wal")
+    assert(empty_stats[1] == 0)
+    print("PASS: missing WAL replay is no-op")
+
+    // ── 7. Checkpoint + truncate leaves only the header ─────────────
+    crash_simulate()
+    wal_init(wal_path)
+    wal_replay(wal_path)
+    wal_checkpoint_and_truncate()
+    let f3: Map = file_open(wal_path, "rb")
+    file_seek(f3, 0, 2)
+    let post_truncate_size: int = file_tell(f3)
+    file_close(f3)
+    assert(post_truncate_size == 5)  // only "NYXW" + version byte
+    print("PASS: checkpoint truncates WAL to header (5 bytes)")
+
+    print("")
+    print("=== ALL WAL TESTS PASSED ===")
+}

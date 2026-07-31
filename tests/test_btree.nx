@@ -1,0 +1,207 @@
+// test_btree.nx — Unit tests for the B-tree secondary index module.
+// Exercises bti_* in isolation; does NOT touch store.nx's SQL surface.
+
+import "std/resp"
+import "src/sql_lexer"
+import "src/sql_parser"
+import "src/btree"
+import "src/wal"
+import "src/store"
+import "src/planner"
+import "src/executor"
+import "src/persist"
+import "src/query"
+
+fn array_contains_int(arr: Array, target: int) -> bool {
+    for v: int in arr {
+        if v == target { return true }
+    }
+    return false
+}
+
+fn assert_sorted_int(arr: Array) {
+    var i: int = 1
+    while i < arr.length() {
+        let a: int = arr[i - 1]
+        let b: int = arr[i]
+        assert(a <= b)
+        i = i + 1
+    }
+}
+
+fn main() {
+    // ── 1. Empty tree ──────────────────────────────────────────────────
+    let t1: int = bti_new_tree()
+    let miss: Array = bti_lookup(t1, "42", "INT")
+    assert(miss.length() == 0)
+    let r_empty: Array = bti_range(t1, "__NEG_INF__", "__POS_INF__", "INT", true, true)
+    assert(r_empty.length() == 0)
+    print("PASS: empty tree")
+
+    // ── 2. Single insert + lookup ─────────────────────────────────────
+    bti_insert(t1, "10", 100, "INT")
+    let r1: Array = bti_lookup(t1, "10", "INT")
+    assert(r1.length() == 1)
+    let first: int = r1[0]
+    assert(first == 100)
+    print("PASS: single insert + lookup")
+
+    // ── 3. Duplicate key collapses rowids ─────────────────────────────
+    bti_insert(t1, "10", 101, "INT")
+    bti_insert(t1, "10", 102, "INT")
+    let r2: Array = bti_lookup(t1, "10", "INT")
+    assert(r2.length() == 3)
+    assert(array_contains_int(r2, 100))
+    assert(array_contains_int(r2, 101))
+    assert(array_contains_int(r2, 102))
+    print("PASS: duplicate key appends rowids")
+
+    // ── 4. Insert 100 distinct keys forces multiple splits ────────────
+    let t2: int = bti_new_tree()
+    var i: int = 0
+    while i < 100 {
+        bti_insert(t2, int_to_string(i), i * 10, "INT")
+        i = i + 1
+    }
+    // Spot check: every key present with exactly its rowid
+    var miss_count: int = 0
+    i = 0
+    while i < 100 {
+        let got: Array = bti_lookup(t2, int_to_string(i), "INT")
+        if got.length() != 1 {
+            miss_count = miss_count + 1
+        } else {
+            let g: int = got[0]
+            if g != i * 10 { miss_count = miss_count + 1 }
+        }
+        i = i + 1
+    }
+    assert(miss_count == 0)
+    print("PASS: 100-key insert + lookup (splits stable)")
+
+    // ── 5. Full range scan returns all 100 rowids in ascending key order ──
+    let r3: Array = bti_range(t2, "__NEG_INF__", "__POS_INF__", "INT", true, true)
+    assert(r3.length() == 100)
+    // Keys were 0..99 inserted with rowid = 10*key, so values come out ascending.
+    assert_sorted_int(r3)
+    let first_rid: int = r3[0]
+    let last_rid: int = r3[99]
+    assert(first_rid == 0)
+    assert(last_rid == 990)
+    print("PASS: full range scan in-order")
+
+    // ── 6. Bounded range scan [30, 60] inclusive ─────────────────────
+    let r4: Array = bti_range(t2, "30", "60", "INT", true, true)
+    assert(r4.length() == 31)  // keys 30..60 inclusive
+    let r4_first: int = r4[0]
+    let r4_last: int = r4[30]
+    assert(r4_first == 300)
+    assert(r4_last == 600)
+    print("PASS: bounded inclusive range")
+
+    // ── 7. Half-open range [50, +inf) ────────────────────────────────
+    let r5: Array = bti_range(t2, "50", "__POS_INF__", "INT", true, true)
+    assert(r5.length() == 50)  // keys 50..99
+    let r5_first: int = r5[0]
+    assert(r5_first == 500)
+    print("PASS: half-open upper range")
+
+    // ── 8. Exclusive low bound (50, 55] ──────────────────────────────
+    let r6: Array = bti_range(t2, "50", "55", "INT", false, true)
+    assert(r6.length() == 5)  // keys 51..55
+    let r6_first: int = r6[0]
+    assert(r6_first == 510)
+    print("PASS: exclusive-low bound")
+
+    // ── 9. lo == hi inclusive equals lookup ──────────────────────────
+    let r7: Array = bti_range(t2, "42", "42", "INT", true, true)
+    assert(r7.length() == 1)
+    let r7_rid: int = r7[0]
+    assert(r7_rid == 420)
+    print("PASS: lo==hi inclusive = lookup")
+
+    // ── 10. Remove a rowid from a duplicate key ──────────────────────
+    let r8_before: Array = bti_lookup(t1, "10", "INT")
+    assert(r8_before.length() == 3)
+    let ok: bool = bti_remove(t1, "10", 101, "INT")
+    assert(ok)
+    let r8_after: Array = bti_lookup(t1, "10", "INT")
+    assert(r8_after.length() == 2)
+    assert(array_contains_int(r8_after, 100))
+    assert(array_contains_int(r8_after, 102))
+    assert(array_contains_int(r8_after, 101) == false)
+    print("PASS: remove one rowid from duplicate key")
+
+    // ── 11. Remove last rowid tombstones the key ──────────────────────
+    bti_remove(t1, "10", 100, "INT")
+    bti_remove(t1, "10", 102, "INT")
+    let r9: Array = bti_lookup(t1, "10", "INT")
+    assert(r9.length() == 0)
+    print("PASS: remove last rowid tombstones key")
+
+    // ── 12. Tombstoned key stays out of range scan ────────────────────
+    let t3: int = bti_new_tree()
+    bti_insert(t3, "5", 50, "INT")
+    bti_insert(t3, "6", 60, "INT")
+    bti_insert(t3, "7", 70, "INT")
+    bti_remove(t3, "6", 60, "INT")
+    let r10: Array = bti_range(t3, "__NEG_INF__", "__POS_INF__", "INT", true, true)
+    assert(r10.length() == 2)  // only 5 and 7 remain
+    assert(array_contains_int(r10, 50))
+    assert(array_contains_int(r10, 70))
+    assert(array_contains_int(r10, 60) == false)
+    print("PASS: tombstone excluded from range")
+
+    // ── 13. NULL ordering: __NULL__ sorts below everything ────────────
+    let t4: int = bti_new_tree()
+    bti_insert(t4, "5", 50, "INT")
+    bti_insert(t4, "__NULL__", 999, "INT")
+    bti_insert(t4, "1", 10, "INT")
+    let r11: Array = bti_range(t4, "__NEG_INF__", "__POS_INF__", "INT", true, true)
+    assert(r11.length() == 3)
+    let r11_first: int = r11[0]
+    assert(r11_first == 999)  // __NULL__ comes first
+    print("PASS: NULL orders below non-null values")
+
+    // ── 14. TEXT column type: lexicographic order ─────────────────────
+    let t5: int = bti_new_tree()
+    bti_insert(t5, "banana", 2, "TEXT")
+    bti_insert(t5, "apple", 1, "TEXT")
+    bti_insert(t5, "cherry", 3, "TEXT")
+    let r12: Array = bti_range(t5, "__NEG_INF__", "__POS_INF__", "TEXT", true, true)
+    assert(r12.length() == 3)
+    let t5_first: int = r12[0]
+    assert(t5_first == 1)  // apple
+    let t5_last: int = r12[2]
+    assert(t5_last == 3)   // cherry
+    let t5_search: Array = bti_lookup(t5, "banana", "TEXT")
+    assert(t5_search.length() == 1)
+    print("PASS: TEXT ordering")
+
+    // ── 15. Root split correctness: insert 6 keys to force root split ──
+    let t6: int = bti_new_tree()
+    i = 0
+    while i < 6 {
+        bti_insert(t6, int_to_string(i), i, "INT")
+        i = i + 1
+    }
+    // After 6 inserts, root was split (max 5 keys).
+    // Verify all 6 lookups still work.
+    i = 0
+    while i < 6 {
+        let got: Array = bti_lookup(t6, int_to_string(i), "INT")
+        assert(got.length() == 1)
+        let g: int = got[0]
+        assert(g == i)
+        i = i + 1
+    }
+    // Range verifies traversal across the new root.
+    let r13: Array = bti_range(t6, "__NEG_INF__", "__POS_INF__", "INT", true, true)
+    assert(r13.length() == 6)
+    assert_sorted_int(r13)
+    print("PASS: root split preserves lookup + range")
+
+    print("")
+    print("All B-tree unit tests passed!")
+    return 0
+}
