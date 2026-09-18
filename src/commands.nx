@@ -3,7 +3,7 @@
 // Receives RESP command array, joins into SQL string,
 // tokenizes, parses, executes, returns RESP response.
 
-fn dispatch_command(cmd: Array, fd: int) -> String {
+pub fn dispatch_command(cmd: Array, fd: int) -> String {
     if cmd.length() == 0 {
         return resp_error("empty command")
     }

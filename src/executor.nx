@@ -252,7 +252,7 @@ fn format_rows_resp(all_rows: Array) -> String {
     return sb.to_string()
 }
 
-fn db_execute(ast: Array, fd: int) -> String {
+pub fn db_execute(ast: Array, fd: int) -> String {
     let tag: String = ast[0]
 
     if tag == "ERROR" {
