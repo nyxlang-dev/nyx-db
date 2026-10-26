@@ -482,21 +482,53 @@ pub fn db_insert(table: String, cols: Array, value_rows: Array) -> Array {
 
 // ── WHERE evaluation ──
 
+// ¿`v` es un entero que entra en 64 bits? INSERT no valida tipos, así que una
+// columna INT puede guardar cualquier texto, y el literal de una consulta lo
+// escribe el cliente. string_to_int ABORTA el proceso ante un valor así (desde
+// Nyx 0.38.0 también ante uno que no entra en 64 bits): todo lo que lea un
+// INT de datos o de una consulta pasa antes por acá. Sin default posible que
+// no sea también un entero válido, se prueba con dos: solo un valor inválido
+// devuelve los dos defaults.
+pub fn es_int_valido(v: String) -> bool {
+    return not (string_to_int_or(v, 0) == 0 and string_to_int_or(v, 1) == 1)
+}
+
+fn es_float_valido(v: String) -> bool {
+    return not (string_to_float_or(v, 0.0) == 0.0 and string_to_float_or(v, 1.0) == 1.0)
+}
+
+// Primer valor no NULL de la columna `idx` que no es un entero, o "" si todos
+// lo son. SUM y AVG lo usan para responder un error en vez de abortar.
+pub fn primer_no_int(rows: Array, idx: int) -> String {
+    for row: Array in rows {
+        let v: String = row[idx]
+        if v != "__NULL__" and not es_int_valido(v) { return v }
+    }
+    return ""
+}
+
 pub fn compare_values(a: String, b: String, col_type: String) -> int {
     // Returns: -1 if a<b, 0 if a==b, 1 if a>b
+    // Un INT compara como entero si los dos lo son; si alguno no entra en 64
+    // bits (o es decimal) compara como float, que ordena bien 1e20 > 5; si
+    // alguno ni siquiera es número, como texto. Nunca aborta.
     if col_type == "INT" or col_type == "INTEGER" {
-        let ai: int = string_to_int(a)
-        let bi: int = string_to_int(b)
-        if ai < bi { return -1 }
-        if ai > bi { return 1 }
-        return 0
+        if es_int_valido(a) and es_int_valido(b) {
+            let ai: int = string_to_int(a)
+            let bi: int = string_to_int(b)
+            if ai < bi { return -1 }
+            if ai > bi { return 1 }
+            return 0
+        }
     }
-    if col_type == "REAL" {
-        let af: float = string_to_float(a)
-        let bf: float = string_to_float(b)
-        if af < bf { return -1 }
-        if af > bf { return 1 }
-        return 0
+    if col_type == "INT" or col_type == "INTEGER" or col_type == "REAL" {
+        if es_float_valido(a) and es_float_valido(b) {
+            let af: float = string_to_float(a)
+            let bf: float = string_to_float(b)
+            if af < bf { return -1 }
+            if af > bf { return 1 }
+            return 0
+        }
     }
     // TEXT comparison (lexicographic via charAt)
     if a == b { return 0 }

@@ -128,6 +128,8 @@ fn exec_group_by(cols: Array, table: String, where_ast: Array, join_ast: Array, 
                 let ai: int = schema_col_index(schema, arg)
                 var total: int = 0
                 if ai >= 0 {
+                    let malo: String = primer_no_int(group_rows, ai)
+                    if malo != "" { return ["ERROR", "SUM(" + arg + "): '" + malo + "' is not an integer"] }
                     for gr: Array in group_rows {
                         let v: String = gr[ai]
                         if v != "__NULL__" {
@@ -143,6 +145,8 @@ fn exec_group_by(cols: Array, table: String, where_ast: Array, join_ast: Array, 
                 var total: int = 0
                 var cnt: int = 0
                 if ai >= 0 {
+                    let malo: String = primer_no_int(group_rows, ai)
+                    if malo != "" { return ["ERROR", "AVG(" + arg + "): '" + malo + "' is not an integer"] }
                     for gr: Array in group_rows {
                         let v: String = gr[ai]
                         if v != "__NULL__" {
@@ -686,6 +690,10 @@ fn exec_aggregate_embedded(agg: String, table: String, where_ast: Array, join_as
     if col_idx < 0 {
         return ["ERROR", "column not found: " + arg]
     }
+    if fn_name == "SUM" or fn_name == "AVG" {
+        let malo: String = primer_no_int(rows, col_idx)
+        if malo != "" { return ["ERROR", fn_name + "(" + arg + "): '" + malo + "' is not an integer"] }
+    }
 
     if fn_name == "SUM" {
         var total: int = 0
@@ -786,6 +794,10 @@ fn exec_aggregate(agg: String, table: String, where_ast: Array, join_ast: Array)
     let col_idx: int = schema_col_index(schema, arg)
     if col_idx < 0 {
         return resp_error("column not found: " + arg)
+    }
+    if fn_name == "SUM" or fn_name == "AVG" {
+        let malo: String = primer_no_int(rows, col_idx)
+        if malo != "" { return resp_error(fn_name + "(" + arg + "): '" + malo + "' is not an integer") }
     }
 
     if fn_name == "SUM" {

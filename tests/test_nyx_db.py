@@ -130,6 +130,23 @@ def test_count(sock):
     assert "2" in resp, f"COUNT failed: {resp}"
     print("  COUNT(*): OK")
 
+def test_numeros_enormes(sock):
+    """Un número que no entra en 64 bits (o que no es número) llega del cliente:
+    es un error, nunca un abort del servidor (string_to_int aborta desde Nyx 0.38.0)."""
+    send_sql(sock, "CREATE TABLE nums (id INT PRIMARY KEY, v INT)")
+    resp = send_sql(sock, "INSERT INTO nums VALUES (1, 99999999999999999999)")
+    assert ":1" in resp, f"INSERT big failed: {resp}"
+    resp = send_sql(sock, "SELECT SUM(v) FROM nums")
+    assert resp.startswith("-") and "not an integer" in resp, f"SUM big should be an error: {resp}"
+    resp = send_sql(sock, "SELECT * FROM nums LIMIT abc")
+    assert resp.startswith("-") and "LIMIT" in resp, f"LIMIT abc should be an error: {resp}"
+    resp = send_sql(sock, "SELECT * FROM nums WHERE id = 99999999999999999999")
+    assert not resp.startswith("-"), f"WHERE big failed: {resp}"
+    sock.sendall(resp_command("PING"))
+    assert "PONG" in read_response(sock), "server died after big numbers"
+    send_sql(sock, "DROP TABLE nums")
+    print("  números que no entran en 64 bits: ERROR, el servidor sigue vivo: OK")
+
 def test_insert_10k(sock):
     """Insert 10K rows — acceptance criterion"""
     t0 = time.time()
@@ -200,6 +217,7 @@ def main():
         test_update(sock)
         test_delete(sock)
         test_count(sock)
+        test_numeros_enormes(sock)
         test_tables(sock)
         test_info(sock)
 

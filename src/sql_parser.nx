@@ -212,7 +212,9 @@ fn parse_order_by() -> Array {
     return ["NONE"]
 }
 
-// Parse LIMIT n [OFFSET m]
+// Parse LIMIT n [OFFSET m] → [lim, off, error]; error es "" si salió bien.
+// n y m los escribe el cliente: un `LIMIT abc`, `LIMIT 1.5` o un número que
+// no entra en 64 bits es un error de sintaxis, no un abort del servidor.
 fn parse_limit() -> Array {
     var lim: int = -1
     var off: int = 0
@@ -220,15 +222,17 @@ fn parse_limit() -> Array {
         p_advance()
         let lim_str: String = p_peek_val()
         p_advance()
-        lim = string_to_int(lim_str)
+        lim = string_to_int_or(lim_str, -1)
+        if lim < 0 { return [-1, 0, "LIMIT expects a non-negative integer, got '" + lim_str + "'"] }
         if p_peek_type() == "KW" and p_peek_val() == "OFFSET" {
             p_advance()
             let off_str: String = p_peek_val()
             p_advance()
-            off = string_to_int(off_str)
+            off = string_to_int_or(off_str, -1)
+            if off < 0 { return [-1, 0, "OFFSET expects a non-negative integer, got '" + off_str + "'"] }
         }
     }
-    return [lim, off]
+    return [lim, off, ""]
 }
 
 // Parse a single column or aggregate expression
@@ -372,6 +376,8 @@ fn parse_select() -> Array {
 
     let order_ast: Array = parse_order_by()
     let lim: Array = parse_limit()
+    let lim_err: String = lim[2]
+    if lim_err != "" { return ["ERROR", lim_err] }
     let lim_val: int = lim[0]
     let off_val: int = lim[1]
 

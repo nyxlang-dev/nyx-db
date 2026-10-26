@@ -127,6 +127,38 @@ fn main() {
 
     db_query("DROP TABLE scores")
 
+    // Números que no entran en 64 bits (o que no son números) llegan del
+    // cliente y no pueden abortar el servidor: string_to_int aborta desde Nyx
+    // 0.38.0 ante un desborde, y ante texto desde siempre.
+    let rw0: Array = db_query("SELECT name FROM users WHERE age > 28")
+    let wrows0: Array = rw0[1]
+    let rbig: Array = db_query("INSERT INTO users VALUES (4, 'Dana', 99999999999999999999)")
+    assert(rbig[0] == "OK")
+    let rw: Array = db_query("SELECT name FROM users WHERE age > 28")
+    assert(rw[0] == "ROWS")
+    let wrows: Array = rw[1]
+    assert(wrows.length() == wrows0.length() + 1)  // Dana (1e20) entra: compara como float
+    let rweq: Array = db_query("SELECT name FROM users WHERE id = 99999999999999999999")
+    assert(rweq[0] == "ROWS")
+    let weqrows: Array = rweq[1]
+    assert(weqrows.length() == 1)  // solo el header: ningún id es 1e20
+    print("PASS: WHERE con un INT que no entra en 64 bits compara sin abortar")
+    let rsum: Array = db_query("SELECT SUM(age) FROM users")
+    assert(rsum[0] == "ERROR")
+    let rgsum: Array = db_query("SELECT name, SUM(age) FROM users GROUP BY name")
+    assert(rgsum[0] == "ERROR")
+    print("PASS: SUM sobre un valor que no es int es ERROR, no abort")
+    let rlim: Array = db_query("SELECT name FROM users LIMIT abc")
+    assert(rlim[0] == "ERROR")
+    let rlim2: Array = db_query("SELECT name FROM users LIMIT 99999999999999999999")
+    assert(rlim2[0] == "ERROR")
+    let rlim3: Array = db_query("SELECT name FROM users LIMIT 2 OFFSET 99999999999999999999")
+    assert(rlim3[0] == "ERROR")
+    let rlim_ok: Array = db_query("SELECT name FROM users LIMIT 2 OFFSET 1")
+    assert(rlim_ok[0] == "ROWS")
+    print("PASS: LIMIT/OFFSET inválidos son ERROR de sintaxis")
+    db_query("DELETE FROM users WHERE id = 4")
+
     // DROP TABLE
     let r12: Array = db_query("DROP TABLE users")
     assert(r12[0] == "OK")
