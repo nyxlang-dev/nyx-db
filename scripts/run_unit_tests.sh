@@ -7,7 +7,7 @@
 # del monorepo (regla preexistente: los runners nunca se solapan).
 set -uo pipefail
 STACK="$(cd "$(dirname "$0")/.." && pwd)"
-NYX_HOME="${NYX_HOME:-/home/admin/nyx/lang}"
+NYX_HOME="${NYX_HOME:-/home/admin/nyxlang}"
 cd "$STACK"
 pass=0; fail=0
 for src in tests/*.nx; do
